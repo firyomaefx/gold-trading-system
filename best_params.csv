@@ -1,0 +1,17 @@
+,0
+hurst_mean_revert,0.35
+zscore_entry_long,-2.5
+zscore_entry_short,3.0
+velocity_epsilon,3.0
+total_return_pct,3.96
+final_value,10395.59
+sharpe_ratio,11.653
+sortino_ratio,19.551
+calmar_ratio,148.934
+max_drawdown_pct,0.85
+num_trades,30.0
+win_rate_pct,86.67
+profit_factor,8.39
+avg_win,0.0
+avg_loss,0.0
+expectancy,0.0
