@@ -7,3 +7,16 @@ __pycache__/
 dist/
 build/
 .ipynb_checkpoints/
+quant_v2/
+marketing/
+paper_reports/
+*.log
+sim_*.py
+dashboard/.snapshot_schedule.json
+dashboard/screenshot.py
+dashboard/silver_panel.py
+dashboard/subscribe.py
+live/silver_trader.py
+config/silver_settings.py
+multi_main.py
+*.pdf

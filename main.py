@@ -21,11 +21,28 @@ Usage:
 import argparse
 import sys
 import os
+import time
+import logging
 import pandas as pd
 import numpy as np
 from datetime import datetime
 
+# Setup logging BEFORE anything else
+log_file = os.path.join(os.path.dirname(__file__), "trader.log")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler(log_file, mode="a"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
 sys.path.insert(0, os.path.dirname(__file__))
+
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 from config.settings import GOLD_CONFIG, DEFAULT_PARAM_GRID
 from data.synthetic import SyntheticDataGenerator
@@ -241,30 +258,152 @@ def cmd_optimize(args):
 
 
 def cmd_live(args):
+    from notifications.telegram import TelegramNotifier
+
     trader = LiveTrader()
 
     if not trader.connect():
+        logger.error("Cannot connect to MT5. Ensure terminal is running.")
         return
+
+    tg = TelegramNotifier.get()
+    tg.send_startup()
+
+    prev_position = None
 
     try:
         tf = args.tf or trader.config.timeframe.primary
 
-        print(f"\nLoading historical data...")
+        logger.info("Loading historical data...")
         trader.load_history(timeframe=tf, bars=args.bars or 2000)
 
-        print(f"\nCalibrating HMM on real data...")
-        trader.calibrate_hmm()
+        logger.info("Calibrating HMM on real data...")
+        try:
+            trader.calibrate_hmm()
+        except Exception as e:
+            logger.warning(f"HMM calibration failed: {e}. Continuing without HMM gate.")
 
-        trader.config.threshold.hmm_ranging_prob = args.hmm_gate or 0.70
+        trader.config.threshold.hmm_ranging_prob = args.hmm_gate or 0.0
 
         interval = args.interval or 60
-        trader.run_loop(sleep_seconds=interval)
+        trader._running = True
+
+        logger.info("=" * 60)
+        logger.info(f"LIVE TRADING STARTED: {trader.config.symbol.symbol}")
+        logger.info(f"Timeframe: {tf}min  |  Interval: {interval}s")
+        logger.info(f"Telegram alerts: ON")
+        logger.info("=" * 60)
+
+        while trader._running:
+            try:
+                signal, zscore, hurst, hmm_prob = trader.run_once()
+
+                status = "LONG" if signal == 1 else "SHORT" if signal == -1 else "WAIT"
+                pos = "IN TRADE" if trader._open_position else "FLAT"
+                entry = ""
+                remark = ""
+                if trader._open_position:
+                    p = trader._open_position
+                    entry = f" | Entry: {p['entry_price']:.2f} SL: {p['sl']:.2f}"
+                    if 'best_zscore' in p:
+                        entry += f" | BestZ: {p['best_zscore']:.2f}"
+                    remark = p.get('entry_hmm', '')
+
+                logger.info(f"[{datetime.now().strftime('%H:%M:%S')}] Signal: {status} | Z: {zscore:+.2f} | H: {hurst:.3f} | HMM: {hmm_prob:.0%} | {pos}{entry}")
+
+                current_pos = dict(trader._open_position) if trader._open_position else None
+
+                if prev_position is None and current_pos is not None:
+                    direction = "BUY" if current_pos["direction"] == 1 else "SELL"
+                    entry_remark = current_pos.get("entry_hmm", f"Z-score: {current_pos['entry_zscore']:.2f}")
+                    tg.send_entry_alert(
+                        direction=direction,
+                        price=current_pos["entry_price"],
+                        zscore=current_pos["entry_zscore"],
+                        hurst=hmm_prob,
+                        volume=current_pos["volume"],
+                        sl=current_pos["sl"],
+                        reason=entry_remark,
+                    )
+
+                elif prev_position is not None and current_pos is None:
+                    prev = prev_position
+                    direction = "BUY" if prev["direction"] == 1 else "SELL"
+                    bid, ask = trader.mt5.get_current_price()
+                    exit_price = ask if prev["direction"] == 1 else bid
+                    pnl = 0.0
+                    exit_reason = "signal_exit"
+                    exit_remark = ""
+                    if trader._trade_history:
+                        last = trader._trade_history[-1]
+                        pnl = last.get("pnl", 0.0)
+                        exit_reason = last.get("reason", "exit")
+                        exit_remark = last.get("remark", "")
+                    full_reason = f"{exit_reason} | {exit_remark}" if exit_remark else exit_reason
+                    tg.send_exit_alert(
+                        direction=direction,
+                        entry_price=prev["entry_price"],
+                        exit_price=exit_price,
+                        pnl=pnl,
+                        reason=full_reason,
+                    )
+
+                prev_position = current_pos
+
+                if tg.should_send_hourly():
+                    try:
+                        df = trader._df if trader._df is not None else trader.mt5.fetch_rates(timeframe=tf, count=300)
+                        bid, ask = trader.mt5.get_current_price()
+                        acc = trader.mt5.get_account_info()
+                        spread = trader.mt5.get_spread()
+                        pos_info = trader.mt5.get_positions()
+                        tg.send_dashboard_snapshot({
+                            "signal_text": status,
+                            "zscore": zscore,
+                            "hurst": hurst,
+                            "hmm_prob": hmm_prob,
+                            "hurst_regime": "N/A",
+                            "bid": bid,
+                            "spread": spread,
+                            "account_equity": acc.get("equity", 0),
+                            "total_pnl": acc.get("equity", 0) - acc.get("balance", acc.get("equity", 0)),
+                            "has_position": trader._open_position is not None,
+                            "position_type": pos_info[0].get("type", "") if pos_info else "",
+                            "position_volume": pos_info[0].get("volume", 0) if pos_info else 0,
+                            "position_pnl": pos_info[0].get("profit", 0) if pos_info else 0,
+                            "daily": trader.daily_performance(),
+                            "weekly": trader.weekly_performance(),
+                            "monthly": trader.monthly_performance(),
+                        })
+                        logger.info("Hourly snapshot sent to Telegram")
+                    except Exception as e:
+                        logger.error(f"Snapshot error: {e}")
+
+            except Exception as e:
+                logger.error(f"Loop error: {e}", exc_info=True)
+                try:
+                    tg.send_error(f"Loop error: {e}")
+                except Exception:
+                    pass
+
+            # Proper sleep — no CPU spinning
+            time.sleep(interval)
+            if not trader._running:
+                break
 
     except KeyboardInterrupt:
-        print("\n\nShutting down...")
+        logger.info("Shutdown requested")
+    except Exception as e:
+        logger.error(f"Fatal error in live loop: {e}", exc_info=True)
     finally:
-        print(trader.trade_summary())
+        trader._running = False
+        try:
+            summary = trader.trade_summary()
+            tg.send_shutdown(summary)
+        except Exception:
+            pass
         trader.stop()
+        logger.info("Trading system stopped")
 
 
 def cmd_dashboard(args):
@@ -274,17 +413,17 @@ def cmd_dashboard(args):
     provider = DashboardDataProvider(GOLD_CONFIG)
 
     print("Connecting to MT5...")
-    if not provider.connect():
-        print("ERROR: Cannot connect to MT5.")
-        print("Ensure MetaTrader 5 terminal is running with GOLD-Pro chart open.")
-        print("Starting dashboard in offline mode for layout preview...")
+    connected = provider.connect()
 
-    provider.refresh()
-    if provider.connected:
+    if connected:
+        provider.refresh()
         acc = provider.mt5.get_account_info()
         print(f"\n  Account: #{acc.get('login', '?')}")
         print(f"  Balance: ${acc.get('balance', 0):.2f}")
         print(f"  Equity:  ${acc.get('equity', 0):.2f}")
+    else:
+        print("WARNING: Cannot connect to MT5.")
+        print("  Dashboard will start anyway. Open MT5 and refresh browser.")
 
     app = create_dashboard(provider, refresh_interval_ms=args.interval)
 

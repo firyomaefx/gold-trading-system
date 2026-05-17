@@ -2,6 +2,8 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 import time
+import json
+import logging
 from typing import Optional, Dict, Tuple
 
 from live.mt5_adapter import MT5Connector
@@ -10,6 +12,24 @@ from risk.kelly import kelly_fraction, position_size, calculate_trade_stats
 from risk.exits import combined_exit
 from risk.stops import atr_from_df
 from config.settings import GoldConfig, GOLD_CONFIG
+
+logger = logging.getLogger(__name__)
+
+
+def _get_period_pnl(history: list, start_dt: datetime, end_dt: datetime) -> tuple:
+    """Filter trades within a date range and compute stats."""
+    period_trades = [
+        t for t in history
+        if start_dt <= t.get("exit_time", datetime.min) <= end_dt
+    ]
+    if not period_trades:
+        return 0, 0, 0.0, 0.0, 0.0
+    wins = [t for t in period_trades if t["pnl"] > 0]
+    losses = [t for t in period_trades if t["pnl"] <= 0]
+    total_pnl = sum(t["pnl"] for t in period_trades)
+    wr = len(wins) / len(period_trades) * 100 if period_trades else 0
+    avg_trade = total_pnl / len(period_trades)
+    return len(period_trades), len(wins), wr, total_pnl, avg_trade
 
 
 class LiveTrader:
@@ -80,6 +100,33 @@ class LiveTrader:
             float(latest.get("hmm_ranging_prob", 0.5)),
         )
 
+    def get_entry_remark(self, signal: int, zscore: float, hurst: float,
+                         hmm_prob: float = 0.5) -> str:
+        """Generate a human-readable remark for why we entered."""
+        remarks = []
+        if signal == 1:
+            remarks.append("Mean-reverting LONG")
+        else:
+            remarks.append("Mean-reverting SHORT")
+        remarks.append(f"H={hurst:.3f}")
+        remarks.append(f"Z={zscore:+.2f}")
+        if hmm_prob >= 0.5:
+            remarks.append(f"HMM ranging={hmm_prob*100:.0f}%")
+        else:
+            remarks.append(f"HMM trending={100-hmm_prob*100:.0f}%")
+        return " | ".join(remarks)
+
+    def get_exit_remark(self, zscore: float, hurst: float, reason: str) -> str:
+        """Generate a human-readable remark for why we exited."""
+        if "zscore_trail" in reason:
+            return f"Z-trail triggered | Z={zscore:+.2f} | H={hurst:.3f}"
+        elif "time" in reason:
+            return f"Time stop | Z={zscore:+.2f} | H={hurst:.3f}"
+        elif "hurst" in reason:
+            return f"Hurst regime flip | Z={zscore:+.2f} | H={hurst:.3f}"
+        else:
+            return f"{reason} | Z={zscore:+.2f} | H={hurst:.3f}"
+
     def calculate_kelly_size(self) -> float:
         if len(self._trade_history) < 10:
             return 0.0
@@ -102,7 +149,8 @@ class LiveTrader:
 
         return kf
 
-    def execute_signal(self, signal: int, zscore: float) -> Optional[Dict]:
+
+    def execute_signal(self, signal: int, zscore: float, hmm_prob: float = 0.5, double_lot: bool = False) -> Optional[Dict]:
         if self._open_position is not None:
             return None
 
@@ -132,6 +180,11 @@ class LiveTrader:
             risk_pct=self.config.risk.account_risk_pct,
         )
 
+        # HIGH CONFIDENCE: double the position size
+        if double_lot:
+            pos_size = pos_size * 2.0
+            print(f"  *** HIGH CONFIDENCE: Doubling position size ***")
+
         symbol_info = self.mt5.get_symbol_info()
         min_vol = symbol_info.get("volume_min", 0.01)
         vol_step = symbol_info.get("volume_step", 0.01)
@@ -153,6 +206,8 @@ class LiveTrader:
 
         print(f"\n{'=' * 50}")
         print(f"  SIGNAL: {order_type}  |  Z-score: {zscore:.2f}")
+        if double_lot:
+            print(f"  *** HIGH CONFIDENCE DOUBLE LOT ***")
         print(f"  Price: {price:.2f}  |  Size: {pos_size} lots  |  SL: {sl:.2f}")
         print(f"  Kelly f*: {kf:.4f}  |  Account: ${equity:.0f}")
         print(f"{'=' * 50}")
@@ -177,40 +232,77 @@ class LiveTrader:
             "volume": pos_size,
             "sl": sl,
             "entry_time": datetime.now(),
+            "best_zscore": abs(zscore),
+            "entry_hurst": self._df.get("hurst", pd.Series([0.5])).iloc[-1] if self._df is not None else 0.5,
+            "entry_hmm": self._last_remark,
         }
 
         self._entry_bar_index = self._current_bar_index
-
+        remark = self.get_entry_remark(signal, zscore, self._open_position["entry_hurst"], hmm_prob=hmm_prob)
+        print(f"  Remark: {remark}")
         print(f"Order #{ticket} executed.")
         return self._open_position
 
-    def check_exits(self, zscore: float) -> Optional[Dict]:
+    def check_exits(self, zscore: float, hurst: float = 0.5) -> Optional[Dict]:
         if self._open_position is None:
             return None
 
+        pos = self._open_position
+        direction = pos["direction"]
+        entry_z = pos["entry_zscore"]
+        current_abs_z = abs(zscore)
+
+        # ── 1. Z-Score trailing stop (statistical) ──
+        # Update best Z reached
+        if current_abs_z > pos.get("best_zscore", abs(entry_z)):
+            pos["best_zscore"] = current_abs_z
+
+        best_z = pos.get("best_zscore", abs(entry_z))
+        retrace_threshold = best_z * (1 - self.config.threshold.zscore_trail_retrace)
+
+        if direction == 1 and zscore > 0:  # Long, Z flipping positive
+            if current_abs_z < retrace_threshold:
+                return self._exit_position(zscore, hurst, "zscore_trail_retrace")
+        elif direction == -1 and zscore < 0:  # Short, Z flipping negative
+            if current_abs_z < retrace_threshold:
+                return self._exit_position(zscore, hurst, "zscore_trail_retrace")
+
+        # ── 2. Hurst emergency exit (regime flip) ──
+        if hurst > self.config.threshold.hurst_exit_threshold:
+            entry_hurst = pos.get("entry_hurst", 0.5)
+            if entry_hurst < self.config.threshold.hurst_mean_revert and hurst > self.config.threshold.hurst_exit_threshold:
+                return self._exit_position(zscore, hurst, f"hurst_regime_flip_{hurst:.2f}")
+
+        # ── 3. Original static Z-score stop (safety net) ──
         should_exit, reason, exit_z = combined_exit(
             current_zscore=zscore,
-            entry_zscore=self._open_position["entry_zscore"],
+            entry_zscore=entry_z,
             bar_index=self._current_bar_index,
-            entry_bar=self._open_position["entry_bar"],
-            signal_direction=self._open_position["direction"],
+            entry_bar=pos["entry_bar"],
+            signal_direction=direction,
             max_bars=self.config.threshold.time_stop_bars,
             zscore_stop_long=self.config.threshold.zscore_stop_long,
             zscore_stop_short=self.config.threshold.zscore_stop_short,
         )
 
-        if not should_exit:
-            return None
+        if should_exit:
+            return self._exit_position(zscore, hurst, reason)
 
+        return None
+
+    def _exit_position(self, zscore: float, hurst: float = 0.5, reason: str = "") -> Optional[Dict]:
+        """Close the current position."""
+        remark = self.get_exit_remark(zscore, hurst, reason)
         pos = self.mt5.get_positions()
         matching = [p for p in pos if p["ticket"] == self._open_position["ticket"]]
         if not matching:
-            print(f"Position #{self._open_position['ticket']} not found. Marking as closed.")
-            self._record_trade(self._open_position["entry_price"], self.mt5.get_current_price()[0])
+            logger.warning(f"Position #{self._open_position['ticket']} not found. Marking as closed.")
+            self._record_trade(self._open_position["entry_price"], self.mt5.get_current_price()[0], remark)
+            closed = dict(self._open_position)
             self._open_position = None
-            return None
+            return closed
 
-        print(f"\n  EXIT: {reason}  |  Z-score: {zscore:.2f}")
+        logger.info(f"EXIT: {remark} | Z-score: {zscore:.2f}")
         success = self.mt5.close_position(self._open_position["ticket"])
         if success:
             pnl = matching[0]["profit"]
@@ -220,16 +312,17 @@ class LiveTrader:
                 "exit_price": matching[0]["current_price"],
                 "pnl": pnl,
                 "reason": reason,
+                "remark": remark,
                 "entry_time": self._open_position["entry_time"],
                 "exit_time": datetime.now(),
             })
-            print(f"Position closed. PnL: ${pnl:.2f}")
+            logger.info(f"Position closed. PnL: ${pnl:.2f}")
 
         closed_pos = dict(self._open_position)
         self._open_position = None
         return closed_pos
 
-    def _record_trade(self, entry_price: float, exit_price: float):
+    def _record_trade(self, entry_price: float, exit_price: float, remark: str = ""):
         if self._open_position is None:
             return
         pnl = (exit_price - entry_price) * self._open_position["direction"] * self._open_position["volume"] * 100
@@ -239,14 +332,15 @@ class LiveTrader:
             "exit_price": exit_price,
             "pnl": pnl,
             "reason": "manual",
+            "remark": remark,
             "entry_time": self._open_position["entry_time"],
             "exit_time": datetime.now(),
         })
 
-    def run_once(self) -> Tuple[int, float]:
+    def run_once(self, double_lot: bool = False) -> Tuple[int, float, float, float, float]:
         """
         Run one iteration of the live trading loop.
-        Returns (signal, zscore).
+        Returns (signal, zscore, hurst, hmm_prob).
         """
         self._df = self.mt5.fetch_rates(
             timeframe=self.config.timeframe.primary,
@@ -256,28 +350,31 @@ class LiveTrader:
         features = self.compute_live_features()
         signal, zscore, hurst, hmm_prob = self.get_latest_signal(features)
 
-        self.check_exits(zscore)
-        self.execute_signal(signal, zscore)
+        self.check_exits(zscore, hurst)
+        self.execute_signal(signal, zscore, hmm_prob=hmm_prob, double_lot=double_lot)
 
-        return signal, zscore
+        return signal, zscore, hurst, hmm_prob
 
-    def run_loop(self, sleep_seconds: int = 60):
+    def run_loop(self, sleep_seconds: int = 60, double_lot: bool = False):
         self._running = True
         print(f"\n{'=' * 60}")
         print(f"  LIVE TRADING STARTED: {self.config.symbol.symbol}")
         print(f"  Timeframe: {self.config.timeframe.primary}min")
+        print(f"  HMM gate: {self.config.threshold.hmm_ranging_prob}")
         print(f"  Update interval: {sleep_seconds}s")
+        if double_lot:
+            print(f"  *** HIGH CONFIDENCE MODE: Double lot enabled ***")
         print(f"{'=' * 60}\n")
 
         try:
             while self._running:
                 try:
-                    signal, zscore = self.run_once()
+                    signal, zscore, hurst, hmm_prob = self.run_once(double_lot=double_lot)
 
                     status = "LONG" if signal == 1 else "SHORT" if signal == -1 else "WAIT"
                     pos = "IN TRADE" if self._open_position else "FLAT"
                     print(f"[{datetime.now().strftime('%H:%M:%S')}] "
-                          f"Signal: {status:>5} | Z: {zscore:>7.2f} | Status: {pos}")
+                          f"Signal: {status:>5} | Z: {zscore:>+.2f} | H: {hurst:.3f} | HMM: {hmm_prob:.0%} | {pos}")
 
                 except Exception as e:
                     print(f"Error in loop iteration: {e}")
@@ -297,6 +394,34 @@ class LiveTrader:
         if self._open_position:
             self.mt5.close_all_positions()
         self.mt5.disconnect()
+
+    def daily_performance(self) -> str:
+        """Return today's performance summary."""
+        now = datetime.now()
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+        n, nw, wr, pnl, avg = _get_period_pnl(self._trade_history, start, end)
+        return f"📅 TODAY: {n} trades | {nw} wins | {wr:.0f}% WR | ${pnl:+.2f}"
+
+    def weekly_performance(self) -> str:
+        """Return this week's performance summary."""
+        now = datetime.now()
+        start = now - timedelta(days=now.weekday())
+        start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=7)
+        n, nw, wr, pnl, avg = _get_period_pnl(self._trade_history, start, end)
+        return f"📊 THIS WEEK: {n} trades | {nw} wins | {wr:.0f}% WR | ${pnl:+.2f}"
+
+    def monthly_performance(self) -> str:
+        """Return this month's performance summary."""
+        now = datetime.now()
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if start.month < 12:
+            end = start.replace(month=start.month + 1)
+        else:
+            end = start.replace(year=start.year + 1, month=1)
+        n, nw, wr, pnl, avg = _get_period_pnl(self._trade_history, start, end)
+        return f"📈 THIS MONTH: {n} trades | {nw} wins | {wr:.0f}% WR | ${pnl:+.2f}"
 
     def trade_summary(self) -> str:
         if not self._trade_history:
@@ -322,5 +447,8 @@ class LiveTrader:
         lines.append(f"  Avg Win:       ${avg_win:.2f}")
         lines.append(f"  Avg Loss:      ${avg_loss:.2f}")
         lines.append(f"  Profit Factor: {pf:.2f}")
+        lines.append(self.daily_performance())
+        lines.append(self.weekly_performance())
+        lines.append(self.monthly_performance())
         lines.append("=" * 50)
         return "\n".join(lines)

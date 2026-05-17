@@ -78,6 +78,25 @@ def build_layout(refresh_interval_ms: int = 5000):
         ], style=HEADER_STYLE),
 
         dbc.Row([
+            dbc.Col([
+                html.Div([
+                    html.Div("TRADING CONTROL", style={"fontSize": "11px", "color": "#888", "textTransform": "uppercase", "marginBottom": "6px"}),
+                    dbc.ButtonGroup([
+                        dbc.Button("START", id="btn-start", color="success", size="sm",
+                                   style={"width": "80px", "fontWeight": "bold"}),
+                        dbc.Button("STOP", id="btn-stop", color="danger", size="sm",
+                                   style={"width": "80px", "fontWeight": "bold"}),
+                        dbc.Button("RESTART", id="btn-restart", color="info", size="sm",
+                                   style={"width": "90px", "fontWeight": "bold"}),
+                        dbc.Button("CLOSE ALL", id="btn-close-all", color="warning", size="sm",
+                                   style={"width": "110px", "fontWeight": "bold"}),
+                    ], size="sm"),
+                    html.Div(id="trade-status-badge", style={"marginTop": "6px", "fontSize": "13px", "fontWeight": "bold"}),
+                ], style=CARD_STYLE),
+            ], width=12),
+        ], className="g-2", style={"marginBottom": "8px"}),
+
+        dbc.Row([
             dbc.Col(make_stat_card("SIGNAL", "sig-display", "", NEUTRAL_COLOR, large=True), width=2),
             dbc.Col(make_stat_card("Z-SCORE", "zscore-display", "σ", "#e0e0e0", large=True), width=2),
             dbc.Col(make_stat_card("HURST", "hurst-display", "", "#e0e0e0", large=True), width=2),
@@ -117,6 +136,31 @@ def build_layout(refresh_interval_ms: int = 5000):
                                  "borderRadius": "8px", "border": "1px solid #0f3460"}),
             ], width=12),
         ], className="g-2"),
+
+        html.Div([
+            html.Div("SNAPSHOT SUBSCRIPTION", style={"fontSize": "12px", "color": "#888", "marginBottom": "4px", "marginTop": "10px"}),
+            html.Div([
+                html.Div([
+                    dcc.Dropdown(
+                        id="snapshot-time-dropdown",
+                        options=[{"label": f"{h:02d}:{m:02d}", "value": f"{h:02d}:{m:02d}"} 
+                                 for h in range(24) for m in [0, 15, 30, 45]],
+                        placeholder="Select time (HH:MM)",
+                        style={"width": "150px", "display": "inline-block", "marginRight": "10px"},
+                        clearable=False,
+                    ),
+                    dbc.Button("SUBSCRIBE", id="btn-subscribe", color="primary", size="sm",
+                               style={"width": "120px", "fontWeight": "bold", "marginRight": "10px"}),
+                    dbc.Button("UNSUBSCRIBE", id="btn-unsubscribe", color="secondary", size="sm",
+                               style={"width": "120px", "fontWeight": "bold"}),
+                ], style={"display": "flex", "alignItems": "center", "marginBottom": "10px"}),
+                html.Div(id="snapshot-status", style={"fontSize": "13px", "color": "#4ecca3", "marginBottom": "8px"}),
+                html.Div(id="snapshot-list", style={"fontSize": "12px", "color": "#e0e0e0"}),
+                html.Div("Max 10 snapshots/day | Separate from hourly snapshots", 
+                         style={"fontSize": "10px", "color": "#666", "marginTop": "8px"}),
+            ], style={"backgroundColor": "#16213e", "padding": "12px", 
+                       "borderRadius": "8px", "border": "1px solid #0f3460"}),
+        ]),
 
         html.Div([
             html.Div("TRADE LOG", style={"fontSize": "12px", "color": "#888", "marginBottom": "4px", "marginTop": "10px"}),

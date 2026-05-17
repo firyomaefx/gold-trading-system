@@ -34,10 +34,16 @@ class ThresholdConfig:
     zscore_stop_short: float = 3.5
     zscore_exit_target: float = 0.0
     zscore_exit_upper: float = 0.5
+    zscore_partial_exit: float = 0.5
+    zscore_trail_retrace: float = 0.30
+    hurst_exit_threshold: float = 0.55
     velocity_epsilon: float = 3.0
-    hmm_ranging_prob: float = 0.0
+    hmm_ranging_prob: float = 0.00
     time_stop_bars: int = 3
     max_consecutive_losses: int = 4
+    atr_ratio_max: float = 1.8
+    session_start_hour: int = 8
+    session_end_hour: int = 21
 
 @dataclass
 class RiskConfig:

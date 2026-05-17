@@ -1,13 +1,318 @@
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from dash import Input, Output, State
+import dash
+from dash import Input, Output, State, html
+from dash.exceptions import PreventUpdate
 import numpy as np
+import threading
+import time
 from datetime import datetime
 
 from dashboard.layout import POSITIVE_COLOR, NEGATIVE_COLOR, NEUTRAL_COLOR, BUY_COLOR, SELL_COLOR
+from notifications.telegram import TelegramNotifier
+
+
+class TradingController:
+    def __init__(self, provider):
+        self.provider = provider
+        self._running = False
+        self._thread = None
+        self._trader = None
+        self._lock = threading.Lock()
+        self.live_log = []
+        self.trade_results = []
+        self._prev_position = None
+        self._tg = TelegramNotifier.get()
+        self._status_text = "IDLE"
+        self._last_error = ""
+        self._stats = {"trades": 0, "wins": 0, "pnl": 0.0}
+
+    @property
+    def is_running(self):
+        if self._running and self._thread and not self._thread.is_alive():
+            self._running = False
+            self._status_text = "CRASHED"
+        return self._running
+
+    def get_status(self):
+        if self.is_running:
+            return "RUNNING"
+        if self._status_text == "CRASHED":
+            return "CRASHED"
+        if self._status_text == "STOPPED":
+            return "STOPPED"
+        return "IDLE"
+
+    def force_stop(self):
+        self._running = False
+        self._thread = None
+        if self._trader:
+            try:
+                self._trader.stop()
+            except Exception:
+                pass
+        self._trader = None
+        self._status_text = "FORCE STOPPED"
+
+    def start(self):
+        if self.is_running:
+            return "ALREADY RUNNING - click STOP first if stuck"
+
+        if self._running:
+            self.force_stop()
+
+        if not self.provider.connected:
+            try:
+                if not self.provider.connect():
+                    return "MT5 NOT CONNECTED - open MT5 terminal"
+            except Exception:
+                return "MT5 NOT CONNECTED - open MT5 terminal"
+
+        from live.trader import LiveTrader
+        self._trader = LiveTrader()
+
+        if not self._trader.connect():
+            self._status_text = "MT5 FAILED"
+            return "MT5 CONNECTION FAILED - reopen MT5 terminal"
+
+        try:
+            self._trader.load_history(timeframe=5, bars=2000)
+            self._trader.calibrate_hmm()
+            self._trader.config.threshold.hmm_ranging_prob = 0.0
+        except Exception as e:
+            self._status_text = "INIT FAILED"
+            self._last_error = str(e)
+            return f"INIT ERROR: {e}"
+
+        self._running = True
+        self._status_text = "RUNNING"
+        self._prev_position = None
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        self._tg.send_startup()
+        return "STARTED"
+
+    def _detect_and_alert(self, signal, zscore):
+        current_pos = None
+        if self._trader and self._trader._open_position:
+            current_pos = dict(self._trader._open_position)
+
+        if self._prev_position is None and current_pos is not None:
+            direction = "BUY" if current_pos["direction"] == 1 else "SELL"
+            self._tg.send_entry_alert(
+                direction=direction,
+                price=current_pos["entry_price"],
+                zscore=current_pos["entry_zscore"],
+                hurst=0.0,
+                volume=current_pos["volume"],
+                sl=current_pos["sl"],
+                reason=f"Z-score: {current_pos['entry_zscore']:.2f}",
+            )
+
+        elif self._prev_position is not None and current_pos is None:
+            prev = self._prev_position
+            direction = "BUY" if prev["direction"] == 1 else "SELL"
+            bid, ask = self._trader.mt5.get_current_price()
+            exit_price = ask if prev["direction"] == 1 else bid
+            pnl = 0.0
+            exit_reason = "signal_exit"
+            if self._trader._trade_history:
+                last = self._trader._trade_history[-1]
+                pnl = last.get("pnl", 0.0)
+                exit_reason = last.get("reason", "exit")
+                self._stats["trades"] += 1
+                if pnl > 0:
+                    self._stats["wins"] += 1
+                self._stats["pnl"] += pnl
+            self._tg.send_exit_alert(
+                direction=direction,
+                entry_price=prev["entry_price"],
+                exit_price=exit_price,
+                pnl=pnl,
+                reason=exit_reason,
+            )
+
+        self._prev_position = current_pos
+
+    def _loop(self):
+        while self._running:
+            try:
+                signal, zscore = self._trader.run_once()
+                self._detect_and_alert(signal, zscore)
+
+                status = "LONG" if signal == 1 else "SHORT" if signal == -1 else "WAIT"
+                pos = "IN TRADE" if self._trader._open_position else "FLAT"
+                entry = ""
+                if self._trader._open_position:
+                    p = self._trader._open_position
+                    entry = f" | Entry: {p['entry_price']:.2f} SL: {p['sl']:.2f}"
+
+                msg = (f"[{datetime.now().strftime('%H:%M:%S')}] "
+                       f"Signal: {status} | Z: {zscore:.2f} | {pos}{entry}")
+
+                with self._lock:
+                    self.live_log.append(msg)
+                    if len(self.live_log) > 200:
+                        self.live_log = self.live_log[-200:]
+
+                if self._tg.should_send_hourly():
+                    try:
+                        data = self.provider.refresh()
+                        self._tg.send_dashboard_snapshot(data)
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                with self._lock:
+                    self.live_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] ERROR: {e}")
+                self._tg.send_error(str(e))
+
+            for _ in range(60):
+                if not self._running:
+                    break
+                time.sleep(1)
+
+    def stop(self):
+        was_running = self._running
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=5)
+        summary_text = ""
+        if self._trader:
+            try:
+                summary_text = self._trader.trade_summary()
+                with self._lock:
+                    self.trade_results.append(summary_text)
+                self._trader.stop()
+            except Exception:
+                pass
+        self._trader = None
+        self._thread = None
+        self._status_text = "STOPPED"
+        if was_running:
+            self._tg.send_shutdown(summary_text)
+        return "STOPPED"
+
+    def close_all(self):
+        closed_msg = f"[{datetime.now().strftime('%H:%M:%S')}] CLOSED ALL POSITIONS"
+        if self._trader and self._trader.mt5:
+            try:
+                self._trader.mt5.close_all_positions()
+                with self._lock:
+                    self.live_log.append(closed_msg)
+            except Exception as e:
+                with self._lock:
+                    self.live_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] CLOSE ERROR: {e}")
+        elif self.provider and self.provider.mt5:
+            try:
+                self.provider.mt5.close_all_positions()
+                with self._lock:
+                    self.live_log.append(closed_msg)
+            except Exception as e:
+                with self._lock:
+                    self.live_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] CLOSE ERROR: {e}")
+        self._tg.send_exit_alert("CLOSE ALL", 0, 0, 0, "manual close all")
+
+    def get_log(self):
+        with self._lock:
+            return list(self.live_log)
+
+    def get_summary(self):
+        with self._lock:
+            if self.trade_results:
+                return self.trade_results[-1]
+        return None
 
 
 def register_callbacks(app, provider):
+    trading_ctrl = TradingController(provider)
+
+    @app.callback(
+        [
+            Output("btn-start", "disabled"),
+            Output("btn-stop", "disabled"),
+            Output("btn-restart", "disabled"),
+            Output("trade-status-badge", "children"),
+            Output("trade-status-badge", "style"),
+        ],
+        [
+            Input("btn-start", "n_clicks"),
+            Input("btn-stop", "n_clicks"),
+            Input("btn-restart", "n_clicks"),
+            Input("interval-refresh", "n_intervals"),
+        ],
+    )
+    def toggle_trading(start_clicks, stop_clicks, restart_clicks, n_intervals):
+        ctx = dash.callback_context
+        if not ctx.triggered:
+            return False, True, False, "IDLE", {
+                "fontSize": "13px", "fontWeight": "bold", "color": "#888",
+            }
+
+        triggered = ctx.triggered[0]["prop_id"]
+
+        if triggered == "interval-refresh.n_intervals":
+            running = trading_ctrl.is_running
+            if running:
+                s = trading_ctrl._stats
+                info = f"ACTIVE | Trades: {s['trades']} Wins: {s['wins']} P&L: ${s['pnl']:.2f}"
+                return True, False, False, info, {
+                    "fontSize": "13px", "fontWeight": "bold", "color": POSITIVE_COLOR,
+                }
+            status = trading_ctrl.get_status()
+            if status == "CRASHED":
+                return False, True, False, "CRASHED - click RESTART or START", {
+                    "fontSize": "13px", "fontWeight": "bold", "color": NEGATIVE_COLOR,
+                }
+            return False, True, False, "IDLE", {
+                "fontSize": "13px", "fontWeight": "bold", "color": "#888",
+            }
+
+        if triggered == "btn-start.n_clicks":
+            result = trading_ctrl.start()
+            if result == "STARTED":
+                return True, False, False, "TRADING ACTIVE", {
+                    "fontSize": "13px", "fontWeight": "bold", "color": POSITIVE_COLOR,
+                }
+            else:
+                return False, True, False, f"FAILED: {result}", {
+                    "fontSize": "13px", "fontWeight": "bold", "color": NEGATIVE_COLOR,
+                }
+
+        elif triggered == "btn-stop.n_clicks":
+            trading_ctrl.stop()
+            return False, True, False, "STOPPED", {
+                "fontSize": "13px", "fontWeight": "bold", "color": NEUTRAL_COLOR,
+            }
+
+        elif triggered == "btn-restart.n_clicks":
+            trading_ctrl.force_stop()
+            time.sleep(2)
+            result = trading_ctrl.start()
+            if result == "STARTED":
+                return True, False, False, "RESTARTED - TRADING ACTIVE", {
+                    "fontSize": "13px", "fontWeight": "bold", "color": POSITIVE_COLOR,
+                }
+            else:
+                return False, True, False, f"RESTART FAILED: {result}", {
+                    "fontSize": "13px", "fontWeight": "bold", "color": NEGATIVE_COLOR,
+                }
+
+        raise PreventUpdate
+
+    @app.callback(
+        Output("btn-close-all", "children"),
+        Input("btn-close-all", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def close_all_positions(n):
+        trading_ctrl.close_all()
+
+        def reset_btn():
+            time.sleep(3)
+            return "CLOSE ALL"
+
+        return "CLOSED - check log"
 
     @app.callback(
         [
@@ -283,39 +588,52 @@ def register_callbacks(app, provider):
     )
     def update_trade_log(n):
         data = provider.refresh()
-        if not data.get("connected"):
-            return html_div("No connection to MT5.", NEGATIVE_COLOR)
-
         lines = []
 
-        if data.get("has_position"):
-            pos_type = data["position_type"].upper()
-            pos_color = BUY_COLOR if pos_type == "BUY" else SELL_COLOR
-            pos_pnl = data["position_pnl"]
-            pnl_color = POSITIVE_COLOR if pos_pnl >= 0 else NEGATIVE_COLOR
+        if trading_ctrl.is_running:
+            log_entries = trading_ctrl.get_log()
+            for entry in log_entries[-20:]:
+                entry_color = NEGATIVE_COLOR if "ERROR" in entry else "#e0e0e0"
+                lines.append(html.Div(entry, style={"padding": "2px 0", "color": entry_color,
+                                                     "fontFamily": "monospace", "fontSize": "11px"}))
+
+            summary = trading_ctrl.get_summary()
+            if summary:
+                lines.append(html.Div("─" * 40, style={"color": "#555", "padding": "4px 0"}))
+                for sline in summary.split("\n"):
+                    lines.append(html.Div(sline, style={"color": NEUTRAL_COLOR, "fontFamily": "monospace",
+                                                         "fontSize": "11px", "padding": "1px 0"}))
+        elif not data.get("connected"):
+            return html.Div("No connection to MT5.", style={"color": NEGATIVE_COLOR})
+        else:
+            if data.get("has_position"):
+                pos_type = data["position_type"].upper()
+                pos_color = BUY_COLOR if pos_type == "BUY" else SELL_COLOR
+                pos_pnl = data["position_pnl"]
+                pnl_color = POSITIVE_COLOR if pos_pnl >= 0 else NEGATIVE_COLOR
+                lines.append(html.Div([
+                    html.Span("[ACTIVE] ", style={"color": NEUTRAL_COLOR, "fontWeight": "bold"}),
+                    html.Span(pos_type, style={"color": pos_color, "fontWeight": "bold"}),
+                    html.Span(f" @ {data['position_open_price']:.2f}  "),
+                    html.Span(f"P&L: ${pos_pnl:+.2f}", style={"color": pnl_color, "fontWeight": "bold"}),
+                    html.Span(f"  Vol: {data['position_volume']} lot(s)"),
+                    html.Span(f"  SL: {data.get('position_sl', 'N/A')}"),
+                ], style={"padding": "3px 0"}))
+
+            status = html.Div([
+                html.Span(f"Z-Score: {data['zscore']:.2f} | ", style={"color": "#f0a500"}),
+                html.Span(f"Hurst: {data['hurst']:.3f} | ", style={"color": "#e94560"}),
+                html.Span(f"Velocity: {data['velocity']:.3f} | ", style={"color": "#888"}),
+                html.Span(f"Signal: {data['signal_text']}", style={
+                    "color": BUY_COLOR if data['signal'] == 1 else SELL_COLOR if data['signal'] == -1 else NEUTRAL_COLOR}),
+            ], style={"padding": "3px 0"})
+            lines.append(status)
+
             lines.append(html.Div([
-                html.Span("[ACTIVE] ", style={"color": NEUTRAL_COLOR, "fontWeight": "bold"}),
-                html.Span(pos_type, style={"color": pos_color, "fontWeight": "bold"}),
-                html.Span(f" @ {data['position_open_price']:.2f}  "),
-                html.Span(f"P&L: ${pos_pnl:+.2f}", style={"color": pnl_color, "fontWeight": "bold"}),
-                html.Span(f"  Vol: {data['position_volume']} lot(s)"),
-                html.Span(f"  SL: {data.get('position_sl', 'N/A')}"),
+                html.Span(f"ATR: {data['atr']:.3f} | ", style={"color": "#888"}),
+                html.Span(f"Spread: {data['spread']}pts | ", style={"color": "#888"}),
+                html.Span(f"Bars: {data['bar_count']}"),
             ], style={"padding": "3px 0"}))
-
-        status = html.Div([
-            html.Span(f"Z-Score: {data['zscore']:.2f} | ", style={"color": "#f0a500"}),
-            html.Span(f"Hurst: {data['hurst']:.3f} | ", style={"color": "#e94560"}),
-            html.Span(f"Velocity: {data['velocity']:.3f} | ", style={"color": "#888"}),
-            html.Span(f"Signal: {data['signal_text']}", style={
-                "color": BUY_COLOR if data['signal'] == 1 else SELL_COLOR if data['signal'] == -1 else NEUTRAL_COLOR}),
-        ], style={"padding": "3px 0"})
-        lines.append(status)
-
-        lines.append(html.Div([
-            html.Span(f"ATR: {data['atr']:.3f} | ", style={"color": "#888"}),
-            html.Span(f"Spread: {data['spread']}pts | ", style={"color": "#888"}),
-            html.Span(f"Bars: {data['bar_count']}"),
-        ], style={"padding": "3px 0"}))
 
         return html.Div(lines)
 
@@ -326,6 +644,49 @@ def register_callbacks(app, provider):
     def update_debug(n):
         data = provider.refresh()
         return f"tick={n}"
+
+    @app.callback(
+        [
+            Output("snapshot-status", "children"),
+            Output("snapshot-status", "style"),
+            Output("snapshot-list", "children"),
+        ],
+        [
+            Input("btn-subscribe", "n_clicks"),
+            Input("btn-unsubscribe", "n_clicks"),
+            Input("snapshot-time-dropdown", "value"),
+            Input("interval-refresh", "n_intervals"),
+        ],
+    )
+    def manage_snapshot_subscription(sub_clicks, unsub_clicks, time_value, n_intervals):
+        from dashboard.subscribe import get_scheduler
+        from notifications.telegram import TelegramNotifier
+        
+        scheduler = get_scheduler()
+        tg = TelegramNotifier.get()
+        chat_id = tg.chat_id
+        
+        ctx = dash.callback_context
+        if not ctx.triggered:
+            # Just show current subscriptions
+            return "", {"color": "#4ecca3"}, scheduler.list_subscriptions(chat_id)
+        
+        triggered = ctx.triggered[0]["prop_id"]
+        
+        if triggered == "btn-subscribe.n_clicks" and time_value:
+            result = scheduler.subscribe(chat_id, time_value)
+            return result, {"color": "#4ecca3"}, scheduler.list_subscriptions(chat_id)
+        
+        elif triggered == "btn-unsubscribe.n_clicks" and time_value:
+            result = scheduler.unsubscribe(chat_id, time_value)
+            return result, {"color": "#e94560"}, scheduler.list_subscriptions(chat_id)
+        
+        elif triggered == "btn-unsubscribe.n_clicks" and not time_value:
+            # Unsubscribe all
+            result = scheduler.unsubscribe(chat_id, None)
+            return result, {"color": "#e94560"}, scheduler.list_subscriptions(chat_id)
+        
+        return "", {"color": "#4ecca3"}, scheduler.list_subscriptions(chat_id)
 
     return app
 

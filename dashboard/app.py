@@ -1,8 +1,10 @@
 import sys
 import os
-import threading
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 from dashboard.layout import app, build_layout
 from dashboard.callbacks import register_callbacks
@@ -16,8 +18,8 @@ def create_dashboard(provider: DashboardDataProvider = None, refresh_interval_ms
 
     if not provider.connected:
         if not provider.connect():
-            print("WARNING: Could not connect to MT5. Dashboard will show disconnected state.")
-            print("Start MetaTrader 5 terminal and refresh the browser.")
+            print("WARNING: Could not connect to MT5. Dashboard will start in offline mode.")
+            print("  Click START after MT5 is running and chart is open.")
 
     app.layout = build_layout(refresh_interval_ms)
     register_callbacks(app, provider)
@@ -29,21 +31,21 @@ def main():
     provider = DashboardDataProvider(GOLD_CONFIG)
 
     print("Connecting to MT5...")
-    if not provider.connect():
-        print("ERROR: Cannot connect to MT5.")
-        print("Ensure MetaTrader 5 terminal is running with GOLD-Pro chart open.")
-        print("Aborting.")
-        return
+    connected = provider.connect()
 
-    provider.refresh()
-    acc = provider.mt5.get_account_info()
-    print(f"\n  Account: #{acc.get('login', '?')}")
-    print(f"  Balance: ${acc.get('balance', 0):.2f}")
-    print(f"  Equity:  ${acc.get('equity', 0):.2f}")
-    print(f"  Leverage: 1:{acc.get('leverage', 0)}")
+    if connected:
+        provider.refresh()
+        acc = provider.mt5.get_account_info()
+        print(f"\n  Account: #{acc.get('login', '?')}")
+        print(f"  Balance: ${acc.get('balance', 0):.2f}")
+        print(f"  Equity:  ${acc.get('equity', 0):.2f}")
+        print(f"  Leverage: 1:{acc.get('leverage', 0)}")
+    else:
+        print("WARNING: Cannot connect to MT5.")
+        print("  Dashboard will start anyway. Open MT5 and refresh browser.")
     print()
 
-    app = create_dashboard(provider)
+    dash_app = create_dashboard(provider)
 
     print("=" * 55)
     print("  DASHBOARD STARTING")
@@ -51,7 +53,7 @@ def main():
     print("=" * 55)
 
     try:
-        app.run(debug=False, host="127.0.0.1", port=8050)
+        dash_app.run(debug=False, host="127.0.0.1", port=8050)
     except KeyboardInterrupt:
         print("\nShutting down...")
     finally:
