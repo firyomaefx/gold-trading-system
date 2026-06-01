@@ -61,6 +61,16 @@ class ThresholdConfig:
     atr_ratio_max: float = 1.8
     session_start_hour: int = 8
     session_end_hour: int = 21
+    adaptive_z_enabled: bool = True
+    kurtosis_window: int = 200
+    kurtosis_tighten_threshold: float = 4.0
+    kurtosis_tighten_factor: float = 1.18
+    kurtosis_loosen_threshold: float = 1.5
+    kurtosis_loosen_factor: float = 0.90
+    multi_tf_enabled: bool = False
+    multi_tf_minutes: int = 15
+    multi_tf_hurst_max: float = 0.45
+    multi_tf_required_bars: int = 200
 
 @dataclass
 class RiskConfig:

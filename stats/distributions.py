@@ -1,5 +1,32 @@
 import numpy as np
+import pandas as pd
 from scipy import stats
+
+
+def rolling_kurtosis(returns: np.ndarray, window: int = 200) -> np.ndarray:
+    """Rolling excess (Fisher) kurtosis. Returns 0 for warmup bars."""
+    n = len(returns)
+    out = np.zeros(n, dtype=np.float64)
+    if n < window:
+        return out
+    s = pd.Series(returns) if False else returns
+    try:
+        import pandas as _pd
+        s = _pd.Series(returns)
+        rk = s.rolling(window=window, min_periods=window // 2).kurt()
+        out = rk.fillna(0.0).to_numpy()
+    except Exception:
+        for i in range(window, n):
+            seg = returns[i - window:i]
+            m = seg.mean()
+            d = seg - m
+            v = (d * d).mean()
+            if v < 1e-16:
+                out[i] = 0.0
+                continue
+            k = (d ** 4).mean() / (v ** 2)
+            out[i] = k - 3.0
+    return out
 
 
 def kurtosis(returns: np.ndarray, fisher: bool = True) -> float:

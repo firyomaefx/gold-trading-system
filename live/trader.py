@@ -90,9 +90,21 @@ class LiveTrader:
             print(f"Not enough data for feature computation. Need {self.config.window.rolling_zscore + 1} bars.")
             return pd.DataFrame()
 
-        features = self.signal_gen.compute_and_generate(self._df)
+        df_htf = None
+        if self.config.threshold.multi_tf_enabled:
+            try:
+                from data.mtf import aggregate_from_minutes
+                df_htf = aggregate_from_minutes(
+                    self._df, minutes=self.config.threshold.multi_tf_minutes
+                )
+            except Exception as e:
+                logger.debug("HTF aggregation failed: %s", e)
+                df_htf = None
+
+        features = self.signal_gen.compute_and_generate(self._df, df_htf=df_htf)
 
         self._current_bar_index = len(features) - 1
+        self._last_htf_hurst = features.attrs.get("htf_hurst", float("nan"))
         return features
 
     def get_latest_signal(self, features: pd.DataFrame) -> Tuple[int, float, float, float]:
@@ -242,6 +254,7 @@ class LiveTrader:
             "best_zscore": abs(zscore),
             "entry_hurst": self._df.get("hurst", pd.Series([0.5])).iloc[-1] if self._df is not None else 0.5,
             "entry_hmm": self._last_remark,
+            "htf_hurst": getattr(self, "_last_htf_hurst", float("nan")),
         }
 
         self._entry_bar_index = self._current_bar_index

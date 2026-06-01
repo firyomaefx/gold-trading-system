@@ -27,11 +27,21 @@ class StatisticalBacktester:
         self,
         df: pd.DataFrame,
         use_kelly: bool = True,
+        df_htf: Optional[pd.DataFrame] = None,
     ) -> Dict:
 
         close = df["close"].values.astype(np.float64)
 
-        signals_df = self.signal_generator.compute_and_generate(df)
+        if df_htf is None and self.config.threshold.multi_tf_enabled:
+            try:
+                from data.mtf import aggregate_from_minutes
+                df_htf = aggregate_from_minutes(
+                    df, minutes=self.config.threshold.multi_tf_minutes
+                )
+            except Exception:
+                df_htf = None
+
+        signals_df = self.signal_generator.compute_and_generate(df, df_htf=df_htf)
         signs_df = self._generate_exit_signals(signals_df)
 
         entries = (signs_df["signal"] == 1).astype(bool)
