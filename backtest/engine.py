@@ -4,7 +4,7 @@ from typing import Optional, Dict
 import vectorbt as vbt
 
 from signals.generator import SignalGenerator
-from risk.kelly import position_size, calculate_trade_stats
+from risk.kelly import position_size, calculate_trade_stats, BayesianKelly
 from risk.exits import apply_exits_to_df
 from backtest.metrics import calculate_metrics
 
@@ -67,7 +67,17 @@ class StatisticalBacktester:
                     trade_results.append(pnl)
 
             if trade_results:
-                win_rate, avg_win, avg_loss, kf = calculate_trade_stats(trade_results)
+                if getattr(self.config.risk, "use_bayesian_kelly", True):
+                    bk = BayesianKelly(
+                        prior_win_rate=self.config.risk.bayesian_prior_win_rate,
+                        prior_strength=self.config.risk.bayesian_prior_strength,
+                        prior_payoff=self.config.risk.bayesian_prior_payoff,
+                        prior_payoff_strength=self.config.risk.bayesian_prior_payoff_strength,
+                    )
+                    bk.update_batch(trade_results)
+                    kf = bk.conservative_kelly(shrink=self.config.risk.bayesian_kelly_shrink)
+                else:
+                    win_rate, avg_win, avg_loss, kf = calculate_trade_stats(trade_results)
                 total_size = position_size(
                     account_equity=self.config.backtest.initial_capital,
                     kelly_f=kf,

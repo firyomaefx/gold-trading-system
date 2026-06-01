@@ -42,7 +42,7 @@ class WindowConfig:
 @dataclass
 class ThresholdConfig:
     hurst_mean_revert: float = 0.35
-    zscore_entry_long: float = -2.5
+    zscore_entry_long: float = -2.7
     zscore_entry_short: float = 3.0
     zscore_stop_long: float = -3.5
     zscore_stop_short: float = 3.5
@@ -53,7 +53,7 @@ class ThresholdConfig:
     hurst_exit_threshold: float = 0.55
     velocity_epsilon: float = 3.0
     hmm_ranging_prob: float = 0.00
-    time_stop_bars: int = 5
+    time_stop_bars: int = 3
     max_consecutive_losses: int = 4
     atr_ratio_max: float = 1.6
     session_start_hour: int = 8
@@ -63,7 +63,7 @@ class ThresholdConfig:
     session_end_hour: int = 21
     adaptive_z_enabled: bool = True
     kurtosis_window: int = 200
-    kurtosis_tighten_threshold: float = 4.0
+    kurtosis_tighten_threshold: float = 6.0
     kurtosis_tighten_factor: float = 1.18
     kurtosis_loosen_threshold: float = 1.5
     kurtosis_loosen_factor: float = 0.90
@@ -79,6 +79,12 @@ class RiskConfig:
     max_daily_loss_pct: float = 0.05
     atr_multiplier_sl: float = 1.5
     gold_bollinger_mult: float = 3.0
+    use_bayesian_kelly: bool = True
+    bayesian_prior_win_rate: float = 0.55
+    bayesian_prior_strength: float = 20.0
+    bayesian_prior_payoff: float = 1.2
+    bayesian_prior_payoff_strength: float = 20.0
+    bayesian_kelly_shrink: float = 0.70
 
 @dataclass
 class BacktestConfig:

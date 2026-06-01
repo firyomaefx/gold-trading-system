@@ -8,7 +8,7 @@ from typing import Optional, Dict, Tuple
 
 from live.mt5_adapter import MT5Connector
 from signals.generator import SignalGenerator
-from risk.kelly import kelly_fraction, position_size, calculate_trade_stats
+from risk.kelly import kelly_fraction, position_size, calculate_trade_stats, BayesianKelly
 from risk.exits import combined_exit
 from risk.stops import atr_from_df
 from config.settings import GoldConfig, GOLD_CONFIG
@@ -45,6 +45,12 @@ class LiveTrader:
         self._df: Optional[pd.DataFrame] = None
         self._obsidian = None
         self._trade_counter = 0
+        self._bayesian_kelly = BayesianKelly(
+            prior_win_rate=getattr(self.config.risk, "bayesian_prior_win_rate", 0.55),
+            prior_strength=getattr(self.config.risk, "bayesian_prior_strength", 20.0),
+            prior_payoff=getattr(self.config.risk, "bayesian_prior_payoff", 1.2),
+            prior_payoff_strength=getattr(self.config.risk, "bayesian_prior_payoff_strength", 20.0),
+        )
         try:
             from obsidian_sync import get_writer
             self._obsidian = get_writer(getattr(self.config, "obsidian", None))
@@ -168,6 +174,25 @@ class LiveTrader:
 
         return kf
 
+    def calculate_bayesian_kelly_size(self) -> float:
+        """Bayesian Kelly — uses Beta-Binomial + log-normal conjugate priors.
+
+        Robust to small samples (shrinks to prior) and adapts as data
+        accumulates. Returns fraction scaled by `kelly_fraction`.
+        """
+        diag = self._bayesian_kelly.diagnostic()
+        kf = diag["kelly_shrunk"]
+        kf = kf * self.config.risk.kelly_fraction
+        return float(max(0.0, kf))
+
+    def _feed_bayesian_kelly(self, pnl: float) -> None:
+        try:
+            self._bayesian_kelly.update(float(pnl))
+        except Exception as e:
+            logger.debug("bayesian kelly update failed: %s", e)
+
+    def bayesian_kelly_diagnostic(self) -> dict:
+        return self._bayesian_kelly.diagnostic()
 
     def execute_signal(self, signal: int, zscore: float, hmm_prob: float = 0.5, double_lot: bool = False) -> Optional[Dict]:
         if self._open_position is not None:
@@ -182,7 +207,10 @@ class LiveTrader:
             print("Cannot execute: account equity is zero or unavailable")
             return None
 
-        kf = self.calculate_kelly_size()
+        if getattr(self.config.risk, "use_bayesian_kelly", True):
+            kf = self.calculate_bayesian_kelly_size()
+        else:
+            kf = self.calculate_kelly_size()
         if kf <= 0:
             kf = 0.01
 
@@ -384,6 +412,7 @@ class LiveTrader:
                 "exit_time": datetime.now(),
             }
             self._trade_history.append(trade_record)
+            self._feed_bayesian_kelly(pnl)
             logger.info(f"Position closed. PnL: ${pnl:.2f}")
 
             if self._obsidian is not None:
