@@ -122,6 +122,30 @@ def cmd_backtest(args):
 
     print(trade_summary(results["metrics"]))
 
+    try:
+        from obsidian_sync import get_writer
+        from obsidian_sync.helpers import backtest_from_results, hourly_snapshot
+        writer = get_writer(getattr(GOLD_CONFIG, "obsidian", None))
+        if writer._enabled:
+            writer.start()
+            m = results["metrics"]
+            backtest_from_results(
+                strategy=f"V1 zscore-mean-reversion TF={cfg_tf}m",
+                total_trades=int(m.get("num_trades", 0)),
+                win_rate=float(m.get("win_rate_pct", 0.0)),
+                net_return=float(m.get("total_return_pct", 0.0)),
+                sharpe=float(m.get("sharpe_ratio", 0.0)),
+                max_drawdown=float(m.get("max_drawdown_pct", 0.0)),
+                notes=f"Source: {args.data or 'mt5' if args.mt5 else 'synthetic'} | bars={len(df)}",
+            )
+            writer.append_dashboard_log(
+                "backtest completed",
+                f"WR={m.get('win_rate_pct', 0):.1f}% ret={m.get('total_return_pct', 0):.2f}% sharpe={m.get('sharpe_ratio', 0):.2f}",
+            )
+            writer.stop()
+    except Exception as e:
+        logger.debug("obsidian backtest write skipped: %s", e)
+
     if args.export:
         eq = bt.equity_curve()
         eq.to_csv(f"equity_{cfg_tf}m_{datetime.now().strftime('%Y%m%d')}.csv")
@@ -259,6 +283,10 @@ def cmd_optimize(args):
 
 def cmd_live(args):
     from notifications.telegram import TelegramNotifier
+
+    if getattr(GOLD_CONFIG, 'disable_mt5', False):
+        logger.error("MT5 connection is disabled. Cannot run live trading.")
+        return
 
     trader = LiveTrader()
 
@@ -406,6 +434,92 @@ def cmd_live(args):
         logger.info("Trading system stopped")
 
 
+def cmd_obsidian_test(args):
+    from obsidian_sync import get_writer
+    from obsidian_sync.helpers import (
+        signal_from_engine,
+        trade_from_engine,
+        backtest_from_results,
+        daily_summary,
+        hourly_snapshot,
+    )
+    from datetime import datetime, timezone
+
+    cfg = getattr(GOLD_CONFIG, "obsidian", None)
+    if cfg is None:
+        print("ERROR: obsidian config missing in settings.py")
+        return 1
+    cfg.enabled = True
+    w = get_writer(cfg)
+    print(f"Vault: {cfg.vault_path}")
+    print(f"Base : {cfg.base()}")
+    if not w.base_ok():
+        print("ERROR: vault path not writable.")
+        return 2
+    w.start()
+    try:
+        w.append_dashboard_log("smoke test", "writing test events")
+        signal_from_engine(
+            trade_id="TEST-001",
+            direction="long",
+            symbol="GOLD-Pro",
+            price=4410.50,
+            zscore=-2.45,
+            atr_ratio=1.10,
+            session="London/NY",
+            filled=True,
+            notes="Smoke test signal",
+        )
+        trade_from_engine(
+            trade_id="TEST-001",
+            direction="long",
+            symbol="GOLD-Pro",
+            entry=4410.50,
+            exit_price=4414.20,
+            stop=4406.00,
+            pnl_usd=18.50,
+            pnl_pips=3.70,
+            zscore_entry=-2.45,
+            zscore_exit=0.30,
+            duration_bars=4,
+            session="London/NY",
+            exit_reason="zscore_trail_retrace",
+            open_time=datetime.now(timezone.utc),
+            close_time=datetime.now(timezone.utc),
+            notes="Smoke test trade",
+        )
+        backtest_from_results(
+            strategy="V1 smoke",
+            total_trades=44,
+            win_rate=65.9,
+            net_return=2.16,
+            sharpe=1.85,
+            max_drawdown=1.20,
+            notes="Smoke test backtest",
+        )
+        daily_summary(
+            total_trades=4,
+            net_pnl=42.30,
+            win_rate=75.0,
+            best_trade=18.50,
+            worst_trade=-7.20,
+        )
+        hourly_snapshot(
+            account="#10047216",
+            balance=10042.30,
+            equity=10045.10,
+            open_pnl=2.80,
+            win_rate=75.0,
+            trades_today=4,
+        )
+        w.append_dashboard_log("smoke test complete", "all 5 event types written")
+    finally:
+        w.stop()
+    print("OK. Open Obsidian and check the GOLD-Trading folder.")
+    print(w.open_in_obsidian("20-Research/GOLD-Trading/README.md"))
+    return 0
+
+
 def cmd_dashboard(args):
     from dashboard.app import create_dashboard
     from dashboard.data_provider import DashboardDataProvider
@@ -415,15 +529,20 @@ def cmd_dashboard(args):
     print("Connecting to MT5...")
     connected = provider.connect()
 
-    if connected:
-        provider.refresh()
-        acc = provider.mt5.get_account_info()
-        print(f"\n  Account: #{acc.get('login', '?')}")
-        print(f"  Balance: ${acc.get('balance', 0):.2f}")
-        print(f"  Equity:  ${acc.get('equity', 0):.2f}")
+    if connected and not getattr(GOLD_CONFIG, 'disable_mt5', False):
+        try:
+            provider.refresh()
+            acc = provider.mt5.get_account_info()
+            print(f"\n  Account: #{acc.get('login', '?')}")
+            print(f"  Balance: ${acc.get('balance', 0):.2f}")
+            print(f"  Equity:  ${acc.get('equity', 0):.2f}")
+        except Exception as e:
+            print(f"WARNING: MT5 connected but initial data fetch failed ({e}).")
+            print("  Open MT5 → ensure GOLD-Pro is in Market Watch.")
+            print("  Dashboard will start anyway.")
     else:
-        print("WARNING: Cannot connect to MT5.")
-        print("  Dashboard will start anyway. Open MT5 and refresh browser.")
+        print("MT5 connection disabled (offline mode).")
+        print("  Dashboard running with backtest data only.")
 
     app = create_dashboard(provider, refresh_interval_ms=args.interval)
 
@@ -483,6 +602,9 @@ def main():
     dash_parser.add_argument("--host", type=str, default="127.0.0.1")
     dash_parser.add_argument("--interval", type=int, default=5000, help="Refresh interval (ms)")
 
+    obs_parser = subparsers.add_parser("obsidian-test", help="Smoke test the Obsidian vault bridge")
+    obs_parser.add_argument("--off", action="store_true", help="Disable (no-op) for testing")
+
     args = parser.parse_args()
 
     commands = {
@@ -493,6 +615,7 @@ def main():
         "optimize": cmd_optimize,
         "live": cmd_live,
         "dashboard": cmd_dashboard,
+        "obsidian-test": cmd_obsidian_test,
     }
 
     if args.command in commands:
@@ -506,6 +629,7 @@ def main():
         print("  python main.py optimize --mt5 --tf 5           # Find best parameters")
         print("  python main.py dashboard                       # Launch monitoring dashboard")
         print("  python main.py live --tf 5                     # Start live trading")
+        print("  python main.py obsidian-test                   # Write smoke-test notes to Obsidian vault")
 
 
 if __name__ == "__main__":

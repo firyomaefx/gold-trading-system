@@ -4,6 +4,14 @@ import numpy as np
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timedelta
 import time
+import os
+import tempfile
+
+
+# Cross-process lock file: prevents ANY Python process from calling mt5.initialize()
+# more than once, no matter how many processes are spawned.
+_MT5_LOCK_FILE = os.path.join(tempfile.gettempdir(), "math_trading_mt5.lock")
+_MT5_SESSION_LOCKED = False
 
 
 class MT5Connector:
@@ -25,22 +33,120 @@ class MT5Connector:
         self.path = path
         self.connected = False
 
-    def connect(self) -> bool:
+    def connect(self, max_attempts: int = 3) -> bool:
+        """
+        Attach to the running MT5 terminal.
+
+        Tries multiple times because MT5 sometimes needs a few seconds after
+        login before the Python API can fetch data.
+        Uses a cross-process lock so we never disturb the session after first attach.
+        """
+        global _MT5_SESSION_LOCKED
+
+        if _MT5_SESSION_LOCKED:
+            self.connected = True
+            return True
+
+        for attempt in range(1, max_attempts + 1):
+            if self.path:
+                ok = mt5.initialize(path=self.path)
+            else:
+                ok = mt5.initialize()
+
+            if ok:
+                try:
+                    ti = mt5.terminal_info()
+                    if ti is None:
+                        raise RuntimeError("Terminal not responding")
+                except Exception:
+                    mt5.shutdown()
+                    print(f"MT5 init attempt {attempt}/{max_attempts} connected but terminal not responding.")
+                    if attempt < max_attempts:
+                        time.sleep(3)
+                    continue
+
+                self.connected = True
+                _MT5_SESSION_LOCKED = True
+
+                acc = mt5.account_info()
+                login = acc.login if acc else "?"
+
+                print(f"MT5 attached (attempt {attempt}/{max_attempts})")
+                print(f"  Terminal: {ti.name} | Account: #{login}")
+                print("  Will follow whatever account you switch to manually in MT5.")
+
+                self._resolve_symbol()
+                return True
+
+            err = mt5.last_error()
+            print(f"MT5 init attempt {attempt}/{max_attempts} failed: {err}")
+            if attempt < max_attempts:
+                time.sleep(2)
+
+        print("\nMT5 connection failed after retries.")
+        print("  → Make sure only ONE MT5 terminal is open.")
+        print("  → Make sure you are logged in and GOLD-Pro is visible.")
+        return False
+
+        # Try to connect (with path if specified, otherwise default)
         if self.path:
-            if not mt5.initialize(path=self.path):
-                print(f"MT5 init failed: {mt5.last_error()}")
-                return False
+            ok = mt5.initialize(path=self.path)
         else:
-            if not mt5.initialize():
-                print(f"MT5 init failed: {mt5.last_error()}")
-                return False
+            ok = mt5.initialize()
+
+        if not ok:
+            err = mt5.last_error()
+            print("MT5 connection failed.")
+            print(f"  Error: {err}")
+            print("  → Make sure MetaTrader 5 is running and logged in.")
+            print("  → Make sure the correct terminal has GOLD-Pro visible.")
+            return False
 
         self.connected = True
-        ti = mt5.terminal_info()
-        print(f"MT5 connected to: {ti.name}")
+        _MT5_SESSION_LOCKED = True
+
+        acc = mt5.account_info()
+        login = acc.login if acc else "?"
+
+        print(f"MT5 attached. Current login: {login}")
+        print("Will follow whatever account you switch to manually in MT5.")
 
         self._resolve_symbol()
         return True
+
+        # First time in any process — initialize the MT5 session
+        if self.path:
+            ok = mt5.initialize(path=self.path)
+        else:
+            ok = mt5.initialize()
+
+        if not ok:
+            print(f"MT5 init failed: {mt5.last_error()}")
+            return False
+
+        self.connected = True
+
+        # Create the lock so no future process touches initialize/shutdown
+        try:
+            with open(_MT5_LOCK_FILE, "w") as f:
+                f.write(str(datetime.now()))
+        except Exception:
+            pass
+
+        acc = mt5.account_info()
+        login = acc.login if acc else "?"
+        print(f"MT5 attached. Will follow whatever account you log into manually.")
+        print(f"Current login: {login}")
+
+        self._resolve_symbol()
+        return True
+
+    def get_current_login(self) -> int:
+        """Returns the account that is currently logged into MT5 right now."""
+        info = mt5.account_info()
+        if info is None:
+            return 0
+        return info.login
 
     def _resolve_symbol(self):
         if mt5.symbol_info(self.symbol) is not None:
@@ -78,10 +184,25 @@ class MT5Connector:
             return [s.name for s in all_symbols if pattern.lower() in s.name.lower()]
         return [s.name for s in all_symbols]
 
-    def disconnect(self):
-        mt5.shutdown()
-        self.connected = False
-        print("MT5 disconnected.")
+    def disconnect(self, force: bool = False):
+        """
+        Release our reference to MT5.
+
+        By default this does ABSOLUTELY NOTHING to the MT5 terminal.
+        We never call mt5.shutdown() during normal operation.
+
+        This is the only way to let you freely switch accounts inside the MT5
+        terminal without the Python code forcing you back to account #10046026.
+
+        Only pass force=True on full program exit if you really want to close MT5.
+        """
+        if force:
+            mt5.shutdown()
+            self.connected = False
+            print("MT5 connection fully closed (forced).")
+        else:
+            self.connected = False
+            # Do nothing to the MT5 session.
 
     def _tf(self, minutes: int):
         if minutes not in self.TIMEFRAME_MAP:
@@ -91,13 +212,19 @@ class MT5Connector:
     def fetch_rates(self, timeframe: int = 5, count: int = 2000, start_date: datetime = None) -> pd.DataFrame:
         tf = self._tf(timeframe)
 
-        if start_date:
-            rates = mt5.copy_rates_from(self.symbol, tf, start_date, count)
-        else:
-            rates = mt5.copy_rates_from_pos(self.symbol, tf, 0, count)
+        for attempt in range(3):
+            if start_date:
+                rates = mt5.copy_rates_from(self.symbol, tf, start_date, count)
+            else:
+                rates = mt5.copy_rates_from_pos(self.symbol, tf, 0, count)
 
-        if rates is None or len(rates) == 0:
-            raise RuntimeError(f"No rates for {self.symbol} TF={timeframe}min: {mt5.last_error()}")
+            if rates is not None and len(rates) > 0:
+                break
+
+            if attempt < 2:
+                time.sleep(2)
+            else:
+                raise RuntimeError(f"No rates for {self.symbol} TF={timeframe}min: {mt5.last_error()}")
 
         df = pd.DataFrame(rates)
         df["time"] = pd.to_datetime(df["time"], unit="s")
@@ -265,6 +392,7 @@ class MT5Connector:
         return result
 
     def get_account_info(self) -> Dict:
+        """Always returns the current account info (respects manual account switches)."""
         info = mt5.account_info()
         if info is None:
             return {}

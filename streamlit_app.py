@@ -34,8 +34,10 @@ def load_csv_data():
 def try_mt5_connect():
     try:
         import MetaTrader5 as mt5
-        if mt5.initialize():
-            return True
+        # Use the passive connector so we don't disturb an existing MT5 session
+        from live.mt5_adapter import MT5Connector
+        c = MT5Connector()
+        return c.connect()
     except Exception:
         pass
     return False

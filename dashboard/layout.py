@@ -97,6 +97,25 @@ def build_layout(refresh_interval_ms: int = 5000):
         ], className="g-2", style={"marginBottom": "8px"}),
 
         dbc.Row([
+            dbc.Col([
+                html.Div([
+                    html.Div("OBSIDIAN", style={"fontSize": "11px", "color": "#888", "textTransform": "uppercase", "marginBottom": "6px"}),
+                    dbc.ButtonGroup([
+                        dbc.Button("Dashboard", id="btn-obsidian-dashboard", color="secondary", size="sm",
+                                   style={"width": "110px", "fontWeight": "bold"}),
+                        dbc.Button("Trades", id="btn-obsidian-trades", color="secondary", size="sm",
+                                   style={"width": "100px", "fontWeight": "bold"}),
+                        dbc.Button("Signals", id="btn-obsidian-signals", color="secondary", size="sm",
+                                   style={"width": "100px", "fontWeight": "bold"}),
+                        dbc.Button("Backtests", id="btn-obsidian-backtests", color="secondary", size="sm",
+                                   style={"width": "110px", "fontWeight": "bold"}),
+                    ], size="sm"),
+                    html.Div(id="obsidian-status", style={"marginTop": "6px", "fontSize": "12px", "color": "#7C3AED"}),
+                ], style=CARD_STYLE),
+            ], width=12),
+        ], className="g-2", style={"marginBottom": "8px"}),
+
+        dbc.Row([
             dbc.Col(make_stat_card("SIGNAL", "sig-display", "", NEUTRAL_COLOR, large=True), width=2),
             dbc.Col(make_stat_card("Z-SCORE", "zscore-display", "σ", "#e0e0e0", large=True), width=2),
             dbc.Col(make_stat_card("HURST", "hurst-display", "", "#e0e0e0", large=True), width=2),

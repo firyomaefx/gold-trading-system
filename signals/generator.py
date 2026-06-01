@@ -18,6 +18,8 @@ class SignalGenerator:
 
     def compute_features(self, df: pd.DataFrame) -> pd.DataFrame:
         close = df["close"].values.astype(np.float64)
+        high = df["high"].values
+        low = df["low"].values
         n = len(close)
         features = pd.DataFrame(index=df.index)
 
@@ -37,6 +39,33 @@ class SignalGenerator:
         features["velocity_zero"] = velocity_approaching_zero(
             velocity, epsilon=self.threshold.velocity_epsilon
         ).astype(int)
+
+        # ATR ratio (volatility expansion filter)
+        prev_close = np.roll(close, 1)
+        prev_close[0] = close[0]
+        tr = np.maximum(high - low, np.maximum(np.abs(high - prev_close), np.abs(low - prev_close)))
+        atr_fast = np.full(n, np.nan)
+        atr_slow = np.full(n, np.nan)
+        if n >= 14:
+            atr_fast[13] = np.mean(tr[:14])
+            atr_slow[13] = np.mean(tr[:14])
+            for i in range(14, n):
+                atr_fast[i] = (atr_fast[i-1] * 13 + tr[i]) / 14
+                if i >= 50:
+                    atr_slow[i] = (atr_slow[i-1] * 49 + tr[i]) / 50
+                else:
+                    atr_slow[i] = atr_fast[i]
+        atr_ratio = np.where(atr_slow > 0, atr_fast / atr_slow, 1.0)
+        features["atr_ratio"] = atr_ratio
+        features["volatility_ok"] = (atr_ratio < self.threshold.atr_ratio_max).astype(int)
+
+        # Session filter (London/NY overlap)
+        if hasattr(df.index, 'hour'):
+            hour = df.index.hour
+            features["session_ok"] = ((hour >= self.threshold.session_start_hour) &
+                                      (hour <= self.threshold.session_end_hour)).astype(int)
+        else:
+            features["session_ok"] = np.ones(n, dtype=int)
 
         try:
             if self.hmm is None:
@@ -63,8 +92,12 @@ class SignalGenerator:
         is_overbought = df["zscore"] > self.threshold.zscore_entry_short
         velocity_flat = df["velocity_zero"] == 1
 
-        long_condition = is_mean_revert & is_oversold & velocity_flat
-        short_condition = is_mean_revert & is_overbought & velocity_flat
+        # New filters for higher win rate
+        volatility_ok = df["volatility_ok"] == 1
+        session_ok = df["session_ok"] == 1
+
+        long_condition = is_mean_revert & is_oversold & velocity_flat & volatility_ok & session_ok
+        short_condition = is_mean_revert & is_overbought & velocity_flat & volatility_ok & session_ok
 
         if "hmm_ranging_prob" in df.columns and self.threshold.hmm_ranging_prob > 0.01:
             hmm_ranging = df["hmm_ranging_prob"] >= self.threshold.hmm_ranging_prob

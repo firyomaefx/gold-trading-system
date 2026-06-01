@@ -21,6 +21,9 @@ class DashboardDataProvider:
         self._initial_equity = None
 
     def connect(self) -> bool:
+        if getattr(self.config, 'disable_mt5', False):
+            self._connected = False
+            return False
         self._connected = self.mt5.connect()
         if self._connected:
             acc = self.mt5.get_account_info()
@@ -29,7 +32,8 @@ class DashboardDataProvider:
         return self._connected
 
     def disconnect(self):
-        self.mt5.disconnect()
+        # Soft disconnect so we don't force MT5 to revert to previous account
+        self.mt5.disconnect(force=False)
         self._connected = False
 
     @property
@@ -37,7 +41,7 @@ class DashboardDataProvider:
         return self._connected
 
     def refresh(self) -> Dict:
-        if not self._connected:
+        if not self._connected or getattr(self.config, 'disable_mt5', False):
             return self._empty_state()
 
         self._df = self.mt5.fetch_rates(

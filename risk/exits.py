@@ -33,10 +33,11 @@ def combined_exit(
     bar_index: int,
     entry_bar: int,
     signal_direction: int,
-    max_bars: int = 3,
+    max_bars: int = 5,
     zscore_stop_long: float = -3.5,
     zscore_stop_short: float = 3.5,
     zscore_target: float = 0.0,
+    zscore_partial: float = 0.5,
 ) -> Tuple[bool, str, float]:
 
     if signal_direction == 1:
@@ -48,6 +49,14 @@ def combined_exit(
 
     if time_stop(entry_bar, bar_index, max_bars):
         return True, "time_stop", current_zscore
+
+    # Partial profit taking
+    if signal_direction == 1 and entry_zscore < -zscore_partial:
+        if current_zscore >= -zscore_partial:
+            return True, "zscore_partial", current_zscore
+    elif signal_direction == -1 and entry_zscore > zscore_partial:
+        if current_zscore <= zscore_partial:
+            return True, "zscore_partial", current_zscore
 
     should_exit, reason = zscore_exit(current_zscore, entry_zscore, target_zscore=zscore_target)
     if should_exit:

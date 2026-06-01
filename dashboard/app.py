@@ -34,15 +34,22 @@ def main():
     connected = provider.connect()
 
     if connected:
-        provider.refresh()
-        acc = provider.mt5.get_account_info()
-        print(f"\n  Account: #{acc.get('login', '?')}")
-        print(f"  Balance: ${acc.get('balance', 0):.2f}")
-        print(f"  Equity:  ${acc.get('equity', 0):.2f}")
-        print(f"  Leverage: 1:{acc.get('leverage', 0)}")
+        try:
+            provider.refresh()
+            acc = provider.mt5.get_account_info()
+            print(f"\n  Account: #{acc.get('login', '?')}")
+            print(f"  Balance: ${acc.get('balance', 0):.2f}")
+            print(f"  Equity:  ${acc.get('equity', 0):.2f}")
+            print(f"  Leverage: 1:{acc.get('leverage', 0)}")
+        except Exception as e:
+            print(f"WARNING: MT5 connected but data fetch failed ({e}).")
+            print("  Open MT5 → make sure GOLD-Pro is in Market Watch.")
+            print("  Dashboard will start anyway — refresh browser after fixing.")
     else:
         print("WARNING: Cannot connect to MT5.")
-        print("  Dashboard will start anyway. Open MT5 and refresh browser.")
+        print("  → Open MT5 terminal and log in.")
+        print("  → Make sure GOLD-Pro symbol is visible.")
+        print("  Dashboard will start anyway — refresh browser after fixing MT5.")
     print()
 
     dash_app = create_dashboard(provider)

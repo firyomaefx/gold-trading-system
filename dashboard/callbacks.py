@@ -55,33 +55,23 @@ class TradingController:
         self._status_text = "FORCE STOPPED"
 
     def start(self):
-        if self.is_running:
-            return "ALREADY RUNNING - click STOP first if stuck"
-
         if self._running:
-            self.force_stop()
-
+            return "ALREADY RUNNING"
         if not self.provider.connected:
-            try:
-                if not self.provider.connect():
-                    return "MT5 NOT CONNECTED - open MT5 terminal"
-            except Exception:
-                return "MT5 NOT CONNECTED - open MT5 terminal"
+            return "MT5 NOT CONNECTED"
 
         from live.trader import LiveTrader
         self._trader = LiveTrader()
 
+        # Passive connect: will attach to whatever account is currently logged in MT5
         if not self._trader.connect():
-            self._status_text = "MT5 FAILED"
-            return "MT5 CONNECTION FAILED - reopen MT5 terminal"
+            return "MT5 CONNECTION FAILED"
 
         try:
             self._trader.load_history(timeframe=5, bars=2000)
             self._trader.calibrate_hmm()
             self._trader.config.threshold.hmm_ranging_prob = 0.0
         except Exception as e:
-            self._status_text = "INIT FAILED"
-            self._last_error = str(e)
             return f"INIT ERROR: {e}"
 
         self._running = True
@@ -299,6 +289,49 @@ def register_callbacks(app, provider):
                 }
 
         raise PreventUpdate
+
+    @app.callback(
+        Output("obsidian-status", "children"),
+        [
+            Input("btn-obsidian-dashboard", "n_clicks"),
+            Input("btn-obsidian-trades", "n_clicks"),
+            Input("btn-obsidian-signals", "n_clicks"),
+            Input("btn-obsidian-backtests", "n_clicks"),
+        ],
+        prevent_initial_call=True,
+    )
+    def open_in_obsidian(dash_clicks, trades_clicks, sig_clicks, bt_clicks):
+        from obsidian_sync import get_writer
+        from config.settings import GOLD_CONFIG
+        cfg = getattr(GOLD_CONFIG, "obsidian", None)
+        if cfg is None:
+            return "Obsidian config missing"
+        if not cfg.enabled:
+            return "Obsidian disabled — set OBSIDIAN_ENABLED=true in .env"
+        w = get_writer(cfg)
+        ctx = dash.callback_context
+        if not ctx.triggered:
+            raise PreventUpdate
+        triggered = ctx.triggered[0]["prop_id"]
+        try:
+            if triggered == "btn-obsidian-dashboard.n_clicks":
+                uri = w.open_in_obsidian("20-Research/GOLD-Trading/Dashboard.md")
+            elif triggered == "btn-obsidian-trades.n_clicks":
+                uri = w.open_in_obsidian("20-Research/GOLD-Trading/Trades")
+            elif triggered == "btn-obsidian-signals.n_clicks":
+                uri = w.open_in_obsidian("20-Research/GOLD-Trading/Signals")
+            elif triggered == "btn-obsidian-backtests.n_clicks":
+                uri = w.open_in_obsidian("20-Research/GOLD-Trading/Backtests")
+            else:
+                raise PreventUpdate
+            return html.A(
+                f"Opened: {uri}",
+                href=uri,
+                target="_blank",
+                style={"color": "#7C3AED", "textDecoration": "underline"},
+            )
+        except Exception as e:
+            return f"Error: {e}"
 
     @app.callback(
         Output("btn-close-all", "children"),

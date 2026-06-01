@@ -37,7 +37,7 @@ class DashboardDataProviderV2:
         return self._connected_mt5 or self._connected_rithmic
 
     def disconnect_all(self):
-        self.mt5.disconnect()
+        self.mt5.disconnect(force=False)
         self.rithmic.disconnect()
 
     @property

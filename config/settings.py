@@ -1,5 +1,19 @@
 from dataclasses import dataclass, field
 from typing import List
+import os as _os
+
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _env_path = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), ".env")
+    if _os.path.exists(_env_path):
+        _load_dotenv(_env_path, override=False)
+except Exception:
+    pass
+
+try:
+    from obsidian_sync.config import ObsidianConfig as _ObsidianConfig
+except Exception:
+    _ObsidianConfig = None  # type: ignore
 
 @dataclass
 class SymbolConfig:
@@ -39,8 +53,11 @@ class ThresholdConfig:
     hurst_exit_threshold: float = 0.55
     velocity_epsilon: float = 3.0
     hmm_ranging_prob: float = 0.00
-    time_stop_bars: int = 3
+    time_stop_bars: int = 5
     max_consecutive_losses: int = 4
+    atr_ratio_max: float = 1.6
+    session_start_hour: int = 8
+    session_end_hour: int = 17
     atr_ratio_max: float = 1.8
     session_start_hour: int = 8
     session_end_hour: int = 21
@@ -74,6 +91,10 @@ class GoldConfig:
     threshold: ThresholdConfig = field(default_factory=ThresholdConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
+    disable_mt5: bool = False  # Set to True to run without MT5 connection
+    obsidian: "object" = field(
+        default_factory=lambda: _ObsidianConfig() if _ObsidianConfig else None
+    )
 
 GOLD_CONFIG = GoldConfig()
 

@@ -43,6 +43,13 @@ class LiveTrader:
         self._entry_bar_index = 0
         self._current_bar_index = 0
         self._df: Optional[pd.DataFrame] = None
+        self._obsidian = None
+        self._trade_counter = 0
+        try:
+            from obsidian_sync import get_writer
+            self._obsidian = get_writer(getattr(self.config, "obsidian", None))
+        except Exception as e:
+            logger.debug("Obsidian writer not initialized: %s", e)
 
     def connect(self) -> bool:
         if not self.mt5.connect():
@@ -239,9 +246,55 @@ class LiveTrader:
 
         self._entry_bar_index = self._current_bar_index
         remark = self.get_entry_remark(signal, zscore, self._open_position["entry_hurst"], hmm_prob=hmm_prob)
+        self._last_remark = remark
         print(f"  Remark: {remark}")
         print(f"Order #{ticket} executed.")
+
+        if self._obsidian is not None:
+            try:
+                self._trade_counter += 1
+                atr_ratio = (
+                    float(self._df["atr_ratio"].iloc[-1])
+                    if self._df is not None and "atr_ratio" in self._df.columns
+                    else 0.0
+                )
+                session = self._current_session_label()
+                from obsidian_sync.helpers import signal_from_engine
+                signal_from_engine(
+                    trade_id=ticket,
+                    direction="long" if signal == 1 else "short",
+                    symbol=self.config.symbol.symbol,
+                    price=price,
+                    zscore=zscore,
+                    atr_ratio=atr_ratio,
+                    session=session,
+                    filled=True,
+                    notes=remark,
+                )
+                self._obsidian.append_dashboard_log(
+                    "entry filled",
+                    f"{'LONG' if signal == 1 else 'SHORT'} {self.config.symbol.symbol} @ {price:.2f} Z={zscore:+.2f}",
+                )
+            except Exception as e:
+                logger.debug("obsidian entry write failed: %s", e)
+
         return self._open_position
+
+    def _current_session_label(self) -> str:
+        try:
+            from datetime import datetime, timezone
+            h = datetime.now(timezone.utc).hour
+            sh = self.config.threshold.session_start_hour
+            eh = self.config.threshold.session_end_hour
+            if sh <= h < eh:
+                if 13 <= h < 17:
+                    return "London/NY"
+                if h < 13:
+                    return "London"
+                return "NewYork"
+            return "off-session"
+        except Exception:
+            return "unknown"
 
     def check_exits(self, zscore: float, hurst: float = 0.5) -> Optional[Dict]:
         if self._open_position is None:
@@ -306,17 +359,47 @@ class LiveTrader:
         success = self.mt5.close_position(self._open_position["ticket"])
         if success:
             pnl = matching[0]["profit"]
-            self._trade_history.append({
+            exit_price = matching[0]["current_price"]
+            trade_record = {
                 "direction": self._open_position["direction"],
                 "entry_price": self._open_position["entry_price"],
-                "exit_price": matching[0]["current_price"],
+                "exit_price": exit_price,
                 "pnl": pnl,
                 "reason": reason,
                 "remark": remark,
                 "entry_time": self._open_position["entry_time"],
                 "exit_time": datetime.now(),
-            })
+            }
+            self._trade_history.append(trade_record)
             logger.info(f"Position closed. PnL: ${pnl:.2f}")
+
+            if self._obsidian is not None:
+                try:
+                    from obsidian_sync.helpers import trade_from_engine
+                    direction = self._open_position["direction"]
+                    entry = self._open_position["entry_price"]
+                    pips = (exit_price - entry) * direction * 100
+                    duration = max(0, self._current_bar_index - self._open_position.get("entry_bar", self._current_bar_index))
+                    trade_from_engine(
+                        trade_id=self._open_position.get("ticket"),
+                        direction="long" if direction == 1 else "short",
+                        symbol=self.config.symbol.symbol,
+                        entry=entry,
+                        exit_price=exit_price,
+                        stop=self._open_position.get("sl"),
+                        pnl_usd=pnl,
+                        pnl_pips=pips,
+                        zscore_entry=self._open_position.get("entry_zscore", 0.0),
+                        zscore_exit=zscore,
+                        duration_bars=duration,
+                        session=self._current_session_label(),
+                        exit_reason=reason,
+                        open_time=self._open_position.get("entry_time"),
+                        close_time=trade_record["exit_time"],
+                        notes=remark,
+                    )
+                except Exception as e:
+                    logger.debug("obsidian trade write failed: %s", e)
 
         closed_pos = dict(self._open_position)
         self._open_position = None
@@ -366,6 +449,16 @@ class LiveTrader:
             print(f"  *** HIGH CONFIDENCE MODE: Double lot enabled ***")
         print(f"{'=' * 60}\n")
 
+        if self._obsidian is not None:
+            try:
+                self._obsidian.start()
+                self._obsidian.append_dashboard_log(
+                    "system started",
+                    f"TF={self.config.timeframe.primary}m interval={sleep_seconds}s",
+                )
+            except Exception as e:
+                logger.debug("obsidian start failed: %s", e)
+
         try:
             while self._running:
                 try:
@@ -387,13 +480,26 @@ class LiveTrader:
             print("\n\nInterrupted. Closing all positions...")
             self._running = False
             self.mt5.close_all_positions()
-            self.mt5.disconnect()
+            self.mt5.disconnect(force=False)
+            if self._obsidian is not None:
+                try:
+                    self._obsidian.append_dashboard_log("system stopped", "KeyboardInterrupt")
+                    self._obsidian.stop()
+                except Exception:
+                    pass
 
     def stop(self):
         self._running = False
         if self._open_position:
             self.mt5.close_all_positions()
-        self.mt5.disconnect()
+        # Use soft disconnect so manual account switches in MT5 take effect immediately
+        self.mt5.disconnect(force=False)
+        if self._obsidian is not None:
+            try:
+                self._obsidian.append_dashboard_log("system stopped", "stop() called")
+                self._obsidian.stop()
+            except Exception:
+                pass
 
     def daily_performance(self) -> str:
         """Return today's performance summary."""
